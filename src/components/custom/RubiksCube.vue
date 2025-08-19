@@ -1,8 +1,9 @@
 <script setup lang="ts">
 import * as THREE from 'three'
 import { onMounted, ref } from 'vue'
+import { useRenderLoop } from '@tresjs/core'
+import { useTresContext } from '@tresjs/core'
 
-// Öffentliche API
 export interface RubikAPI {
   rotate: (face: 'U'|'D'|'L'|'R'|'F'|'B', dir: 1|-1, duration?: number) => Promise<boolean>
   scramble: (moves?: number, minDelayMs?: number) => Promise<void>
@@ -11,24 +12,16 @@ export interface RubikAPI {
 const exposeApi: RubikAPI = { rotate: async () => false, scramble: async () => {}, isBusy: () => false }
 defineExpose(exposeApi)
 
-// Root-Gruppe, an die wir die 27 Cubies hängen
-const root = ref<THREE.Group>()
+const root = ref<THREE.Group | null>(null)
+const { invalidate } = useTresContext() // needed because parent canvas is manual
 
-// ————— Würfel-Factory ——————————————————————
 function createRubiksCube() {
-  const SIZE = 3
   const GAP = 0.02
   const CUBIE = 1 - GAP
   const SPACING = 1.0
 
   const COLORS = {
-    U: 0xffffff, // oben: weiß
-    D: 0xffd500, // unten: gelb
-    F: 0xc41e3a, // vorn: rot
-    B: 0xff5800, // hinten: orange
-    R: 0x009e60, // rechts: grün
-    L: 0x0051ba, // links: blau
-    BLANK: 0x141414
+    U: 0xffffff, D: 0xffd500, F: 0xc41e3a, B: 0xff5800, R: 0x009e60, L: 0x0051ba, BLANK: 0x141414
   }
 
   const group = new THREE.Group()
@@ -36,22 +29,18 @@ function createRubiksCube() {
 
   const boxGeo = new THREE.BoxGeometry(CUBIE, CUBIE, CUBIE)
   const mkMats = (ix:number, iy:number, iz:number) => {
-    const m = (cond:boolean, color:number) => new THREE.MeshStandardMaterial({ color: cond ? color : COLORS.BLANK, metalness: 0.1, roughness: 0.6 })
-    return [
-      m(ix === +1, COLORS.R), // +X
-      m(ix === -1, COLORS.L), // -X
-      m(iy === +1, COLORS.U), // +Y
-      m(iy === -1, COLORS.D), // -Y
-      m(iz === +1, COLORS.F), // +Z
-      m(iz === -1, COLORS.B), // -Z
-    ]
+    const m = (cond:boolean, color:number) =>
+      new THREE.MeshStandardMaterial({ color: cond ? color : COLORS.BLANK, metalness: 0.1, roughness: 0.6 })
+    // +X, -X, +Y, -Y, +Z, -Z
+    return [ m(ix===+1, COLORS.R), m(ix===-1, COLORS.L),
+             m(iy===+1, COLORS.U), m(iy===-1, COLORS.D),
+             m(iz===+1, COLORS.F), m(iz===-1, COLORS.B) ]
   }
 
   for (let ix=-1; ix<=1; ix++) for (let iy=-1; iy<=1; iy++) for (let iz=-1; iz<=1; iz++) {
     const cube = new THREE.Mesh(boxGeo, mkMats(ix,iy,iz))
     cube.position.set(ix*SPACING, iy*SPACING, iz*SPACING)
     cube.castShadow = true; cube.receiveShadow = true
-    // Logische Gitter-Indices
     ;(cube as any).userData.index = { x: ix, y: iy, z: iz }
     group.add(cube)
   }
@@ -121,16 +110,12 @@ function createRubiksCube() {
       const target = angle * t
       const delta = target - prev
       pivot.rotateOnAxis(axis, delta)
-
+      invalidate() // tell parent <TresCanvas render-mode="manual"> to render this frame
       if (t < 1) requestAnimationFrame((n)=>step(n, target).then(res))
       else res()
     })
 
     await new Promise<void>(r => requestAnimationFrame((n)=>step(n, 0).then(r)))
-
-    // Snap auf genau 90°, reparent, Indices & Positionen korrigieren
-    const leftover = angle - (pivot as any).rotation._z // _z ist egal, wir haben über rotateOnAxis akkumuliert
-    if (Math.abs(leftover) > 1e-6) pivot.rotateOnAxis(axis, leftover)
 
     layer.forEach((c:any) => {
       group.attach(c)
@@ -143,13 +128,14 @@ function createRubiksCube() {
       c.rotation.z = snap90(c.rotation.z)
     })
     group.remove(pivot)
+    invalidate() // final frame
     isRotating = false
     return true
   }
 
   async function scramble(moves=25, minDelayMs=40) {
     if (isRotating) return
-    const faces: RubikFace[] = ['U','D','L','R','F','B']
+    const faces: Array<'U'|'D'|'L'|'R'|'F'|'B'> = ['U','D','L','R','F','B']
     for (let i=0; i<moves; i++){
       const f = faces[Math.floor(Math.random()*faces.length)]
       const d = Math.random()<0.5 ? 1 : -1
@@ -158,17 +144,15 @@ function createRubiksCube() {
     }
   }
 
-  type RubikFace = 'U'|'D'|'L'|'R'|'F'|'B'
   return { group, rotate, scramble, isBusy: () => isRotating }
 }
 
-// ————— Setup beim Mount ——————————————————————
 onMounted(() => {
   const g = root.value!
   const { group, rotate, scramble, isBusy } = createRubiksCube()
   g.add(group)
 
-  // einfache Beleuchtung + Boden (optional, kannst du entfernen)
+  // Lights & ground (use parent's renderer/camera)
   const ambient = new THREE.AmbientLight(0xffffff, 0.6)
   const dir = new THREE.DirectionalLight(0xffffff, 1)
   dir.position.set(6,10,4)
@@ -184,14 +168,17 @@ onMounted(() => {
   ground.receiveShadow = true
   g.add(ground)
 
-  // API rausreichen
+  // expose API to parent
   exposeApi.rotate = rotate
   exposeApi.scramble = scramble
   exposeApi.isBusy = isBusy
+
+  // first paint (manual mode needs one)
+  invalidate()
 })
 </script>
 
 <template>
-  <!-- Root-Container für alles vom Würfel -->
+  <!-- attaches to the parent's TresCanvas -->
   <TresGroup ref="root" />
 </template>
